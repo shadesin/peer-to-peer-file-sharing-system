@@ -1,4 +1,4 @@
-# Peer-to-Peer File Sharing System (AOS Assignment 3)
+# Peer-to-Peer File Sharing System
 
 ## Overview
 This project implements a peer-to-peer (P2P) file sharing system with **two redundant trackers** for fault tolerance and synchronization.  
