@@ -1,0 +1,13 @@
+.DS_Store
+/client/client
+/tracker/tracker
+/tests/unit
+/tests/last-run-logs/
+__pycache__/
+*.dSYM/
+*.key
+.p2p-*
+tracker_state_*.log
+tracker_sync.txt
+tracker*.lock
+*.part

@@ -1,7 +1,8 @@
-all:
-	g++ -std=c++17 -pthread -Wno-deprecated-declarations client.cpp -o client \
-	-I$(shell brew --prefix openssl@3)/include \
-	-L$(shell brew --prefix openssl@3)/lib -lssl -lcrypto
-
+include ../common/build.mk
+.DEFAULT_GOAL := all
+.PHONY: all clean
+all: client
+client: client.cpp ../common/common.hpp ../common/build.mk
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) client.cpp $(LDFLAGS) $(LDLIBS) -o $@
 clean:
 	rm -f client

@@ -1,0 +1,31 @@
+name: C++ regression checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [none, address, thread]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: sudo apt-get update && sudo apt-get install -y g++ libssl-dev pkg-config
+      - name: Build and test
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          TSAN_OPTIONS: halt_on_error=1
+          SANITIZER: ${{ matrix.sanitizer }}
+        run: |
+          if [ "$SANITIZER" = none ]; then
+            make CXX=g++ test
+            P2P_LARGE_TEST=1 python3 tests/integration.py Integration.test_one_gib_transfer
+          else
+            make CXX=g++ SANITIZE="$SANITIZER" test
+          fi

@@ -1,0 +1,7 @@
+test_one_gib_transfer (__main__.Integration.test_one_gib_transfer) ... {"bytes": 1073741824, "upload_hash_and_register_seconds": 0.777, "download_verify_and_register_seconds": 1.778, "downloader_peak_sampled_rss_kib": 14592, "source_sha1": "2a492f15396a6768bcbca016993f4b4c8b0b5307", "destination_sha1": "2a492f15396a6768bcbca016993f4b4c8b0b5307", "environment": "single machine, loopback, sparse zero-filled source; RSS sampled every 100 ms"}
+ok
+
+----------------------------------------------------------------------
+Ran 1 test in 4.034s
+
+OK

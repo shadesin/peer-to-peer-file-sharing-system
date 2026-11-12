@@ -1,1320 +1,471 @@
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <sys/select.h>
-#include <unistd.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <cerrno>
-#include <cstring>
-#include <fstream>
-#include <iostream>
-#include <map>
-#include <mutex>
-#include <set>
-#include <sstream>
-#include <string>
-#include <thread>
-#include <vector>
-#include <atomic>
+#include "../common/common.hpp"
+#include <sys/file.h>
 
-using std::cerr;
-using std::cin;
-using std::cout;
-using std::endl;
-using std::ifstream;
-using std::map;
-using std::mutex;
-using std::ofstream;
-using std::set;
-using std::stringstream;
-using std::string;
-using std::thread;
-using std::vector;
-
-static mutex state_mtx;
-static mutex session_mtx;
-static mutex push_mtx;
-static std::atomic<bool> running(true);
-static string lockfile;
-
-struct State
-{
-    map<string,string> users;// userid->password
-    map<string,string> group_owner;// groupid->owner
-    map<string,set<string>> group_members;// groupid->members
-    map<string,vector<string>> join_requests;// groupid->pending
+using namespace p2p;
+namespace {
+struct User { std::string salt, password; };
+struct Session { std::string uid, endpoint; uint64_t expires = 0; bool revoked = false; };
+struct SharedFile { Metadata metadata; std::set<std::string> seeders; };
+struct Group {
+    std::string owner; std::set<std::string> members, requests;
+    std::map<std::string, SharedFile> files;
 };
-
-struct ClientInfo
-{
-    string userid;
-    string ip;
-    int port;
+struct Event {
+    unsigned origin; uint64_t sequence, clock; std::string request, fingerprint, action, response, encoded;
 };
+class Tracker {
+    std::vector<Address> addresses;
+    unsigned identity;
+    SigningKey key;
+    Fd journal;
+    std::mutex state_mutex, sync_mutex, nonce_mutex;
+    std::array<std::vector<Event>, 2> logs;
+    uint64_t logical_clock = 0;
+    bool storage_failed = false;
+    std::map<std::string, User> users;
+    std::map<std::string, Group> groups;
+    std::map<std::string, Session> sessions;
+    std::map<std::string, std::string> current_session;
+    std::map<std::string, uint64_t> leases;
+    std::map<std::string, std::string> replies;
+    std::map<std::string, std::string> fingerprints;
+    std::map<std::string, uint64_t> nonces;
+    std::array<uint64_t, 2> remote_counts{{0, 0}};
 
-map<int,ClientInfo> sessions; // socket -> client info
-
-struct FileInfo
-{
-    string owner; // user who uploaded
-    string ip; // client IP
-    int port; // client port
-    string path; // filename only
-    int num_pieces; // number of 512KB pieces
-    string file_hash; // SHA1 hash of full file
-    long long file_size; // size of full file in bytes
-    vector<string> piece_hashes; // SHA1 hashes of pieces
-};
-
-map<string, vector<FileInfo>> group_files; // group_id -> list of shared files
-
-
-static State global_state;
-static vector<std::pair<string,int>> trackers;
-static int this_tracker_index=0;
-static bool stop_retry=false;
-static int listen_sock=-1;
-
-
-string trim(const string&s)
-{
-    size_t i=0;
-    while(i<s.size()&&(s[i]==' '||s[i]=='\t'||s[i]=='\r'||s[i]=='\n'))
-    {
-        i++;
+    static std::string cluster_key(const std::string& path) {
+        // O_EXCL makes simultaneous first startup safe. The seed is never sent to clients.
+        Fd fd(open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600));
+        if (fd) {
+            std::string seed(32, '\0');
+            require(RAND_bytes(reinterpret_cast<unsigned char*>(&seed[0]), 32) == 1, "key generation failed");
+            write_fd(fd.value, seed.data(), seed.size()); require(fsync(fd.value) == 0, "key sync failed");
+            sync_parent(path); return seed;
+        }
+        require(errno == EEXIST, "cannot create cluster key");
+        for (int attempt = 0; attempt < 50; ++attempt) {
+            auto seed = read_file(path, 32);
+            if (seed.size() == 32) return seed;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        throw std::runtime_error("incomplete cluster key file");
     }
-    size_t j=s.size();
-    while(j>i&&(s[j-1]==' '||s[j-1]=='\t'||s[j-1]=='\r'||s[j-1]=='\n'))
-    {
-        j--;
+    Event decode_event(const std::string& data) const {
+        Fields f = unpack(data); arity(f, 8);
+        std::string signature = f.back(); f.pop_back();
+        require(equal_secret(signature, mac(key.secret, pack(f))), "invalid event authentication");
+        unsigned origin = static_cast<unsigned>(number(f[0], 2)); require(origin >= 1, "invalid event origin");
+        uint64_t seq = number(f[1], 1000000), clock = number(f[2], 1000000000);
+        require(seq > 0 && clock > 0 && hex_string(f[3], 32), "invalid event identity");
+        require(hex_string(f[4], 64), "invalid request fingerprint");
+        Fields action = unpack(f[5]); arity(action, 4); unpack(action[3]);
+        Fields response = unpack(f[6]); require(response.size() >= 2 && response[0] == "OK", "invalid event response");
+        return {origin, seq, clock, f[3], f[4], f[5], f[6], data};
     }
-    return s.substr(i,j-i);
-}
-
-bool parse_ipport(const string&line,string&ip,int&port)
-{
-    size_t colon=line.find(':');
-    if(colon==string::npos)
-    {
+    void remove_seeder(const std::string& sid) {
+        for (auto& g : groups) for (auto& f : g.second.files) f.second.seeders.erase(sid);
+    }
+    void apply(const Event& event) {
+        // Replaying the same union in Lamport/origin/sequence order produces the same state.
+        // Preconditions also give deterministic outcomes to genuinely conflicting partition writes.
+        Fields f = unpack(event.action); Fields a = unpack(f[3]);
+        const std::string& cmd = f[0]; const std::string& uid = f[1]; const std::string& sid = f[2];
+        if (cmd == "create_user") { if (!users.count(a[0])) users[a[0]] = {a[1], a[2]}; }
+        else if (cmd == "login") {
+            auto old = current_session.find(uid);
+            if (old != current_session.end()) { sessions[old->second].revoked = true; remove_seeder(old->second); }
+            sessions[sid] = {uid, a[0], number(a[1]), false}; current_session[uid] = sid;
+            leases[sid] = std::max(leases[sid], number(a[2]));
+        } else if (cmd == "logout") {
+            if (sessions.count(sid)) sessions[sid].revoked = true;
+            remove_seeder(sid);
+        } else if (cmd == "create_group") {
+            if (!groups.count(a[0]) && users.count(uid)) {
+                Group g; g.owner = uid; g.members.insert(uid); groups[a[0]] = std::move(g);
+            }
+        } else {
+            auto found = groups.find(a[0]); if (found == groups.end()) return;
+            auto& g = found->second;
+            if (cmd == "join_group") {
+                if (!g.members.count(uid)) g.requests.insert(uid);
+            } else if (cmd == "accept_request") {
+                if (g.owner == uid && g.requests.erase(a[1])) g.members.insert(a[1]);
+            } else if (cmd == "leave_group") {
+                if (!g.members.erase(uid)) return;
+                g.requests.erase(uid);
+                for (auto& file : g.files) {
+                    for (auto it = file.second.seeders.begin(); it != file.second.seeders.end();) {
+                        auto s = sessions.find(*it);
+                        if (s == sessions.end() || s->second.uid == uid) it = file.second.seeders.erase(it); else ++it;
+                    }
+                }
+                if (g.members.empty()) groups.erase(found);
+                else if (g.owner == uid) g.owner = *g.members.begin();
+            } else if (cmd == "upload_file" && g.members.count(uid)) {
+                auto m = Metadata::from(unpack(a[2])); auto existing = g.files.find(a[1]);
+                if (existing == g.files.end() || existing->second.seeders.empty()) g.files[a[1]] = {m, {}};
+                auto& file = g.files[a[1]];
+                if (file.metadata.fields() == m.fields()) file.seeders.insert(sid);
+            } else if (cmd == "stop_share") {
+                auto file = g.files.find(a[1]); if (file != g.files.end()) file->second.seeders.erase(sid);
+            }
+        }
+    }
+    void rebuild() {
+        users.clear(); groups.clear(); sessions.clear(); current_session.clear(); replies.clear(); fingerprints.clear();
+        std::vector<const Event*> ordered;
+        for (const auto& log : logs) for (const auto& e : log) ordered.push_back(&e);
+        std::sort(ordered.begin(), ordered.end(), [](const Event* a, const Event* b) {
+            return std::tie(a->clock, a->origin, a->sequence) < std::tie(b->clock, b->origin, b->sequence);
+        });
+        for (const Event* e : ordered) {
+            if (!replies.emplace(e->request, e->response).second) continue;
+            fingerprints[e->request] = e->fingerprint;
+            apply(*e);
+        }
+    }
+    bool ingest(const std::string& data, bool persist) {
+        Event e = decode_event(data); auto& log = logs[e.origin - 1];
+        if (e.sequence <= log.size()) {
+            require(log[static_cast<size_t>(e.sequence - 1)].encoded == data, "conflicting event identity; check tracker storage/identity");
+            return false;
+        }
+        require(e.sequence == log.size() + 1, "noncontiguous event sequence");
+        if (persist) {
+            require(!storage_failed, "journal unavailable; restart after repairing storage");
+            try {
+                std::string record; put32(record, static_cast<uint32_t>(data.size())); record += data;
+                off_t end = lseek(journal.value, 0, SEEK_CUR);
+                require(end >= 0 && static_cast<uint64_t>(end) + record.size() <= 128 * 1024 * 1024, "journal exceeds 128 MiB safety limit");
+                write_fd(journal.value, record.data(), record.size());
+                require(fsync(journal.value) == 0, "journal sync failed");
+            } catch (...) { storage_failed = true; throw; }
+        }
+        logical_clock = std::max(logical_clock, e.clock); log.push_back(std::move(e)); return true;
+    }
+    void load_journal() {
+        struct stat st{}; require(fstat(journal.value, &st) == 0 && st.st_size >= 0, "journal stat failed");
+        require(static_cast<uint64_t>(st.st_size) <= 128 * 1024 * 1024, "journal exceeds 128 MiB safety limit");
+        off_t offset = 0;
+        while (offset < st.st_size) {
+            uint32_t n = 0; ssize_t got = pread(journal.value, &n, 4, offset);
+            if (got < 0 && errno == EINTR) continue;
+            require(got >= 0, "journal read failed");
+            if (got < 4) break;
+            n = ntohl(n); require(n >= 4 && n <= MAX_FRAME, "corrupt journal length");
+            if (st.st_size - offset - 4 < static_cast<off_t>(n)) break;
+            std::string data(n, '\0'); size_t read_bytes = 0;
+            while (read_bytes < n) {
+                ssize_t r = pread(journal.value, &data[read_bytes], n - read_bytes, offset + 4 + static_cast<off_t>(read_bytes));
+                if (r < 0 && errno == EINTR) continue;
+                require(r > 0, "journal read failed"); read_bytes += static_cast<size_t>(r);
+            }
+            ingest(data, false); offset += 4 + n;
+        }
+        if (offset != st.st_size) {
+            require(ftruncate(journal.value, offset) == 0 && fsync(journal.value) == 0, "cannot repair incomplete journal tail");
+            std::cerr << "Recovered incomplete final journal record\n";
+        }
+        require(lseek(journal.value, 0, SEEK_END) >= 0, "journal seek failed"); rebuild();
+    }
+    std::string commit(const std::string& rid, const std::string& fingerprint, const Fields& action, const Fields& response) {
+        Fields f{std::to_string(identity), std::to_string(logs[identity - 1].size() + 1),
+            std::to_string(logical_clock + 1), rid, fingerprint, pack(action), pack(response)};
+        f.push_back(mac(key.secret, pack(f))); ingest(pack(f), true); rebuild(); return pack(response);
+    }
+    std::string summary() const { return pack({std::to_string(logs[0].size()), std::to_string(logs[1].size())}); }
+    Fields missing(const std::array<uint64_t, 2>& counts) const {
+        Fields result; size_t total = 0;
+        for (size_t i = 0; i < 2; ++i) {
+            require(counts[i] <= 1000000, "invalid log cursor");
+            for (uint64_t j = counts[i]; j < logs[i].size(); ++j) {
+                const auto& data = logs[i][static_cast<size_t>(j)].encoded;
+                if (total + data.size() > 350 * 1024) return result;
+                total += data.size() + 4; result.push_back(data);
+            }
+        }
+        return result;
+    }
+    static std::array<uint64_t, 2> counts(const std::string& data) {
+        Fields f = unpack(data); arity(f, 2); return {{number(f[0], 1000000), number(f[1], 1000000)}};
+    }
+    std::string lease_data() {
+        Fields result; uint64_t t = now();
+        for (auto it = leases.begin(); it != leases.end();) {
+            if (it->second < t) it = leases.erase(it);
+            else { result.push_back(pack({it->first, std::to_string(it->second)})); ++it; }
+        }
+        require(result.size() <= 4096, "too many live sessions"); return pack(result);
+    }
+    void merge_leases(const std::string& data) {
+        Fields list = unpack(data); require(list.size() <= 4096, "too many leases");
+        for (const auto& record : list) {
+            Fields f = unpack(record); arity(f, 2); require(hex_string(f[0], 32), "invalid lease session");
+            uint64_t expiry = number(f[1]);
+            require(expiry <= now() + LEASE_SECONDS + 5, "invalid lease expiry");
+            if (expiry >= now()) leases[f[0]] = std::max(leases[f[0]], expiry);
+        }
+    }
+    Fields signed_rpc(const Fields& body) {
+        std::string nonce = random_id(), timestamp = std::to_string(now()), encoded = pack(body);
+        Fields request{"REPLICA", timestamp, nonce, encoded}; request.push_back(mac(key.secret, pack(request)));
+        Fields response = p2p::exchange(addresses[2 - identity], request); arity(response, 3);
+        require(response[0] == nonce && equal_secret(response[2], mac(key.secret, pack({response[0], response[1]}))), "invalid replica response");
+        return unpack(response[1]);
+    }
+    Fields replica(const Fields& request) {
+        arity(request, 5);
+        uint64_t timestamp = number(request[1]), t = now();
+        require(timestamp <= t + 30 && timestamp + 30 >= t && hex_string(request[2], 32), "expired replica request");
+        Fields signed_fields(request.begin(), request.begin() + 4);
+        require(equal_secret(request[4], mac(key.secret, pack(signed_fields))), "replica authentication failed");
+        {
+            std::lock_guard<std::mutex> lock(nonce_mutex);
+            for (auto it = nonces.begin(); it != nonces.end();) {
+                if (it->second + 60 < t) it = nonces.erase(it); else ++it;
+            }
+            require(nonces.size() < 4096 && nonces.emplace(request[2], timestamp).second, "replayed replica request");
+        }
+        Fields body = unpack(request[3]), result;
+        require(!body.empty(), "empty replica command");
+        if (body[0] == "SYNC") {
+            arity(body, 4); auto wanted = counts(body[1]); Fields incoming = unpack(body[2]);
+            std::lock_guard<std::mutex> lock(state_mutex);
+            bool changed = false;
+            for (const auto& data : incoming) changed = ingest(data, true) || changed;
+            if (changed) rebuild(); merge_leases(body[3]);
+            result = {"OK", summary(), pack(missing(wanted)), lease_data()};
+        } else if (body[0] == "FORWARD") {
+            arity(body, 2); require(identity == 1, "forward target must be tracker 1");
+            try { result = execute(unpack(body[1])); }
+            catch (const std::exception& e) { result = {"ERROR", e.what()}; }
+        } else throw std::runtime_error("unknown replica command");
+        std::string response = pack(result);
+        return {request[2], response, mac(key.secret, pack({request[2], response}))};
+    }
+    bool live(const std::string& sid) const {
+        auto s = sessions.find(sid); auto lease = leases.find(sid);
+        if (s == sessions.end() || s->second.revoked || s->second.expires <= now() || lease == leases.end() || lease->second <= now()) return false;
+        auto active = current_session.find(s->second.uid);
+        return active != current_session.end() && active->second == sid;
+    }
+    std::pair<std::string, std::string> authenticate(const std::string& token) const {
+        auto f = verify_token(token, key.public_key); arity(f, 5);
+        require(f[0] == "SESSION" && number(f[4]) > now(), "expired session");
+        auto s = sessions.find(f[2]); auto current = current_session.find(f[1]);
+        require(s != sessions.end() && !s->second.revoked && s->second.uid == f[1] &&
+            s->second.endpoint == f[3] && s->second.expires == number(f[4]) &&
+            current != current_session.end() && current->second == f[2], "session is no longer active");
+        return {f[1], f[2]};
+    }
+    Fields execute(const Fields& request) {
+        arity(request, 5); require(request[0] == "RPC" && hex_string(request[1], 32), "invalid request");
+        const std::string& rid = request[1]; const std::string& token = request[2];
+        const std::string& command = request[3]; Fields args = unpack(request[4]);
+        const std::string fingerprint = mac(key.secret, pack(request));
+        Fields response; bool changed = false;
+        {
+            std::unique_lock<std::mutex> lock(state_mutex);
+            auto previous = replies.find(rid);
+            if (previous != replies.end()) {
+                require(equal_secret(fingerprints.at(rid), fingerprint), "request ID was already used for different arguments");
+                Fields cached = unpack(previous->second);
+                lock.unlock(); synchronize(true); return cached;
+            }
+            std::string uid, sid;
+            if (command != "create_user" && command != "login") {
+                auto who = authenticate(token); uid = who.first; sid = who.second;
+            }
+            Fields action_args = args;
+            response = {"OK", "operation completed"};
+            if (command == "create_user") {
+                arity(args, 2); identifier(args[0]); require(!args[1].empty() && args[1].size() <= 256, "invalid password length");
+                require(!users.count(args[0]), "user exists");
+                std::string salt = random_id(); action_args = {args[0], salt, password_hash(args[1], salt)};
+                response[1] = "user created"; changed = true;
+            } else if (command == "login") {
+                arity(args, 3); identifier(args[0]); require(args[1].size() <= 256, "invalid password length"); address(args[2]);
+                lease_data(); require(leases.size() < 4096, "live session limit reached");
+                auto user = users.find(args[0]);
+                require(user != users.end() && equal_secret(password_hash(args[1], user->second.salt), user->second.password), "invalid user or password");
+                auto active = current_session.find(args[0]);
+                require(active == current_session.end() || !live(active->second), "user already logged in");
+                uid = args[0]; sid = rid; uint64_t expiry = now() + 12 * 60 * 60;
+                action_args = {args[2], std::to_string(expiry), std::to_string(now() + LEASE_SECONDS)};
+                response = {"OK", "logged in", key.token({"SESSION", uid, sid, args[2], std::to_string(expiry)}), key.public_key};
+                changed = true;
+            } else if (command == "heartbeat") {
+                arity(args, 0); leases[sid] = now() + LEASE_SECONDS;
+                response = {"OK", "session renewed", std::to_string(leases[sid])};
+            } else if (command == "authorize_piece") {
+                arity(args, 1); auto ticket = verify_token(args[0], key.public_key); arity(ticket, 8);
+                require(ticket[0] == "TICKET" && number(ticket[7]) > now() && live(ticket[2]), "expired or revoked download authorization");
+                auto requester = sessions.find(ticket[2]);
+                require(requester != sessions.end() && requester->second.uid == ticket[1], "invalid ticket session");
+                auto group = groups.find(ticket[3]);
+                require(group != groups.end() && group->second.members.count(uid) && group->second.members.count(ticket[1]), "group access revoked");
+                auto file = group->second.files.find(ticket[4]);
+                require(file != group->second.files.end() && file->second.seeders.count(sid) &&
+                    file->second.metadata.hash == ticket[5] && file->second.metadata.size == number(ticket[6], MAX_FILE), "share authorization revoked");
+                response[1] = "piece authorized";
+            } else if (command == "logout") {
+                arity(args, 0); response[1] = "logged out"; changed = true;
+            } else if (command == "list_groups") {
+                arity(args, 0); response[1] = "GROUPS";
+                for (const auto& g : groups) response.push_back(g.first);
+            } else if (command == "create_group") {
+                arity(args, 1); identifier(args[0]); require(!groups.count(args[0]), "group exists");
+                response[1] = "group created"; changed = true;
+            } else {
+                require(!args.empty(), "missing group"); identifier(args[0]);
+                auto found = groups.find(args[0]); require(found != groups.end(), "no such group"); auto& group = found->second;
+                if (command == "join_group") {
+                    arity(args, 1); require(!group.members.count(uid), "already a member");
+                    require(!group.requests.count(uid), "join request already pending"); response[1] = "join request sent"; changed = true;
+                } else {
+                    require(group.members.count(uid), "not a group member");
+                    if (command == "leave_group") { arity(args, 1); response[1] = "left group"; changed = true; }
+                    else if (command == "list_requests") {
+                        arity(args, 1); require(group.owner == uid, "only owner may view requests");
+                        response[1] = "REQUESTS"; for (const auto& user : group.requests) response.push_back(user);
+                    } else if (command == "accept_request") {
+                        arity(args, 2); require(group.owner == uid, "only owner may accept requests");
+                        require(group.requests.count(args[1]), "request not found"); response[1] = "request accepted"; changed = true;
+                    } else if (command == "upload_file") {
+                        arity(args, 3); filename(args[1]); Metadata m = Metadata::from(unpack(args[2]));
+                        auto old = group.files.find(args[1]);
+                        require(old == group.files.end() || old->second.seeders.empty() || old->second.metadata.fields() == m.fields(), "filename already identifies different content");
+                        response[1] = "file uploaded"; changed = true;
+                    } else if (command == "stop_share") {
+                        arity(args, 2); filename(args[1]); auto file = group.files.find(args[1]);
+                        require(file != group.files.end() && file->second.seeders.count(sid), "file is not shared by this session");
+                        response[1] = "stopped sharing file"; changed = true;
+                    } else if (command == "list_files") {
+                        arity(args, 1); response[1] = "FILES";
+                        for (const auto& file : group.files) {
+                            bool available = false; for (const auto& peer : file.second.seeders) available = available || live(peer);
+                            if (available) response.push_back(file.first);
+                        }
+                    } else if (command == "download_file") {
+                        arity(args, 2); filename(args[1]); auto file = group.files.find(args[1]);
+                        require(file != group.files.end(), "file not found"); Fields peers;
+                        for (const auto& peer : file->second.seeders) if (live(peer)) peers.push_back(sessions.at(peer).endpoint);
+                        require(!peers.empty(), "no online seeders");
+                        auto& m = file->second.metadata;
+                        std::string ticket = key.token({"TICKET", uid, sid, args[0], args[1], m.hash,
+                            std::to_string(m.size), std::to_string(now() + TICKET_SECONDS)});
+                        response = {"OK", "file metadata", pack(m.fields()), pack(peers), ticket};
+                    } else throw std::runtime_error("unknown command");
+                }
+            }
+            if (changed) {
+                require(logs[0].size() + logs[1].size() < 100000, "journal event limit reached");
+                commit(rid, fingerprint, {command, uid, sid, pack(action_args)}, response);
+            }
+        }
+        if (changed) synchronize(true);
+        else if (command == "heartbeat") synchronize();
+        return response;
+    }
+public:
+    Tracker(std::vector<Address> a, unsigned id, const std::string& key_path)
+        : addresses(std::move(a)), identity(id), key(cluster_key(key_path)) {
+        std::string path = "tracker_state_" + std::to_string(identity) + ".log";
+        journal = Fd(open(path.c_str(), O_RDWR | O_CREAT | O_NOFOLLOW, 0600));
+        require(static_cast<bool>(journal), "cannot open journal");
+        require(flock(journal.value, LOCK_EX | LOCK_NB) == 0, "tracker journal already in use");
+        load_journal(); sync_parent(path);
+    }
+    bool synchronize(bool wait = false) {
+        std::unique_lock<std::mutex> syncing(sync_mutex, std::defer_lock);
+        if (wait) syncing.lock();
+        else if (!syncing.try_lock()) return false;
+        try {
+            for (int round = 0; round < 512; ++round) {
+                Fields request;
+                { std::lock_guard<std::mutex> lock(state_mutex);
+                  request = {"SYNC", summary(), pack(missing(remote_counts)), lease_data()}; }
+                Fields response = signed_rpc(request); arity(response, 4); require(response[0] == "OK", "replica sync rejected");
+                auto remote = counts(response[1]); Fields incoming = unpack(response[2]);
+                bool done;
+                { std::lock_guard<std::mutex> lock(state_mutex);
+                  bool changed = false; for (const auto& data : incoming) changed = ingest(data, true) || changed;
+                  if (changed) rebuild(); merge_leases(response[3]); remote_counts = remote;
+                  done = remote[0] == logs[0].size() && remote[1] == logs[1].size(); }
+                if (done) return true;
+            }
+        } catch (const std::exception&) { return false; }
         return false;
     }
-    ip=line.substr(0,colon);
-    string ps=line.substr(colon+1);
-    port=std::stoi(ps);
-    return true;
-}
-
-void load_tracker_info(const string&fname)
-{
-    ifstream in(fname);
-    if(!in)
-    {
-        cerr<<"could not open tracker info file "<<fname<<endl;
-        return;
-    }
-    string line;
-    while(std::getline(in,line))
-    {
-        string t=trim(line);
-        if(t.size()==0)
-        {
-            continue;
-        }
-        string ip;
-        int port;
-        if(parse_ipport(t,ip,port)==false)
-        {
-            continue;
-        }
-        trackers.push_back({ip,port});
-    }
-}
-
-string state_to_string()
-{
-    stringstream ss;
-    state_mtx.lock();
-    for(auto &p:global_state.users)
-    {
-        ss<<"USER "<<p.first<<" "<<p.second<<"\n";
-    }
-    for(auto &p:global_state.group_owner)
-    {
-        string gid=p.first;
-        string owner=p.second;
-        ss<<"GROUP "<<gid<<" "<<owner<<"\n";
-        auto &members=global_state.group_members[gid];
-        for(auto &m:members)
-        {
-            ss<<"MEMBER "<<gid<<" "<<m<<"\n";
-        }
-    }
-    for(auto &p:global_state.join_requests)
-    {
-        string gid=p.first;
-        for(auto &u:p.second)
-        {
-            ss<<"REQ "<<gid<<" "<<u<<"\n";
-        }
-    }
-    for(auto &p:group_files)
-    {
-        string gid=p.first;
-        for(auto &f:p.second)
-        {
-            ss<<"FILE "<<gid<<" "<<f.owner<<" "<<f.ip<<":"<<f.port<<" "<<f.path<<" "
-            <<f.num_pieces<<" "<<f.file_hash<<" "<<f.file_size;
-            for(auto &h:f.piece_hashes)
-            {
-                ss<<" "<<h;
-            }
-            ss<<"\n";
-        }
-    }
-    state_mtx.unlock();
-    return ss.str();
-}
-
-void write_sync_file()
-{
-    string payload=state_to_string();
-    push_mtx.lock();
-    ofstream out("tracker_sync.txt",std::ofstream::trunc);
-    if(!out)
-    {
-        push_mtx.unlock();
-        cerr<<"could not write tracker_sync.txt"<<endl;
-        return;
-    }
-    out<<payload;
-    out.close();
-    push_mtx.unlock();
-}
-
-void apply_state_from_string(const string&payload)
-{
-    state_mtx.lock();
-    global_state.users.clear();
-    global_state.group_owner.clear();
-    global_state.group_members.clear();
-    global_state.join_requests.clear();
-    group_files.clear();
-    stringstream ss(payload);
-    string line;
-    while(std::getline(ss,line))
-    {
-        stringstream ls(line);
-        string tag;
-        ls>>tag;
-        if(tag=="USER")
-        {
-            string uid,pw;
-            ls>>uid>>pw;
-            if(uid.size())
-            {
-                global_state.users[uid]=pw;
-            }
-        }
-        else if(tag=="GROUP")
-        {
-            string gid,owner;
-            ls>>gid>>owner;
-            if(gid.size())
-            {
-                global_state.group_owner[gid]=owner;
-            }
-        }
-        else if(tag=="MEMBER")
-        {
-            string gid,uid;
-            ls>>gid>>uid;
-            if(gid.size()&&uid.size())
-            {
-                global_state.group_members[gid].insert(uid);
-            }
-        }
-        else if(tag=="REQ")
-        {
-            string gid,uid;
-            ls>>gid>>uid;
-            if(gid.size()&&uid.size())
-            {
-                global_state.join_requests[gid].push_back(uid);
-            }
-        }
-        else if(tag=="FILE")
-        {
-            string gid,owner,addr,path,file_hash;
-            int num_pieces;
-            long long file_size;
-            ls>>gid>>owner>>addr>>path>>num_pieces>>file_hash>>file_size;
-            string cip; int cport;
-            if(parse_ipport(addr,cip,cport))
-            {
-                FileInfo fi;
-                fi.owner=owner;
-                fi.ip=cip;
-                fi.port=cport;
-                fi.path=path;
-                fi.num_pieces=num_pieces;
-                fi.file_hash=file_hash;
-                fi.file_size=file_size;
-                for(int i=0;i<num_pieces;i++)
-                {
-                    string h; ls>>h;
-                    fi.piece_hashes.push_back(h);
+    void handle(int fd) {
+      while (true) {
+        Fields request;
+        auto respond = [&](const Fields& response) {
+            if (request.size() == 5 && request[0] == "RPC" && hex_string(request[1], 32)) {
+                std::string body = pack(response);
+                send_frame(fd, pack({"SIGNED", request[1], body, key.sign(pack({request[1], body}))}));
+            } else send_frame(fd, pack(response));
+        };
+        try {
+            request = unpack(receive_frame(fd)); require(!request.empty(), "empty command"); Fields response;
+            if (request[0] == "HELLO") { arity(request, 1); response = {"OK", "P2P/2", key.public_key}; }
+            else if (request[0] == "REPLICA") response = replica(request);
+            else {
+                arity(request, 5); require(request[0] == "RPC", "unknown protocol role");
+                bool forwarded = false;
+                // Prefer one writer while connected, but retain availability during an outage.
+                if (identity == 2) {
+                    try { response = signed_rpc({"FORWARD", pack(request)}); forwarded = true; }
+                    catch (const std::exception&) { /* Independent log is reconciled on recovery. */ }
                 }
-                group_files[gid].push_back(fi);
+                if (!forwarded) response = execute(request);
+            }
+            respond(response);
+        } catch (const std::exception& e) {
+            try { respond({"ERROR", e.what()}); } catch (...) {}
+            return;
+        }
+      }
+    }
+};
+volatile std::sig_atomic_t interrupted = 0;
+void signal_handler(int) { interrupted = 1; }
+} // namespace
+
+int main(int argc, char** argv) {
+    std::signal(SIGPIPE, SIG_IGN); std::signal(SIGINT, signal_handler); std::signal(SIGTERM, signal_handler);
+    try {
+        require(argc == 3 || argc == 4, "Usage: ./tracker tracker_info.txt <1|2> [cluster-key-file]");
+        auto addresses = tracker_info(argv[1]); unsigned id = static_cast<unsigned>(number(argv[2], 2)); require(id >= 1, "tracker number must be 1 or 2");
+        Tracker tracker(addresses, id, argc == 4 ? argv[3] : std::string(argv[1]) + ".key");
+        tracker.synchronize();
+        Server server(addresses[id - 1], [&](int fd) { tracker.handle(fd); });
+        std::atomic<bool> stopping{false};
+        std::thread replication([&] {
+            while (!stopping) {
+                tracker.synchronize();
+                for (int i = 0; i < 5 && !stopping; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        });
+        std::cout << "Tracker listening on " << address_text(addresses[id - 1]) << std::endl;
+        // Poll console input so shutdown can join all workers and the replication thread.
+        std::string input; bool console_open = true;
+        while (!interrupted) {
+            pollfd p{STDIN_FILENO, POLLIN, 0}; int r = poll(console_open ? &p : nullptr, console_open ? 1 : 0, 100);
+            if (r > 0 && (p.revents & (POLLIN | POLLHUP))) {
+                char buffer[256]; ssize_t n = read(STDIN_FILENO, buffer, sizeof(buffer));
+                if (n <= 0) console_open = false;
+                else {
+                    input.append(buffer, static_cast<size_t>(n)); size_t pos;
+                    while ((pos = input.find('\n')) != std::string::npos) {
+                        auto line = input.substr(0, pos); input.erase(0, pos + 1);
+                        if (line == "quit" || line == "quit\r") interrupted = 1;
+                    }
+                    if (input.size() > 4096) input.clear();
+                }
             }
         }
-    }
-    state_mtx.unlock();
-}
-
-void load_sync_file()
-{
-    ifstream in("tracker_sync.txt");
-    if(!in)
-    {
-        return;
-    }
-    string content;
-    string line;
-    while(std::getline(in,line))
-    {
-        content+=line+"\n";
-    }
-    if(content.size()>0)
-    {
-        apply_state_from_string(content);
-    }
-}
-
-int push_sync_to_peer_once(const string&payload)
-{
-    if(trackers.size()<2)
-    {
-        return -1;
-    }
-    int peer_index=(this_tracker_index+1)%trackers.size();
-    string peer_ip=trackers[peer_index].first;
-    int peer_port=trackers[peer_index].second;
-    int s=socket(AF_INET,SOCK_STREAM,0);
-    if(s<0)
-    {
-        return -1;
-    }
-    sockaddr_in addr;
-    addr.sin_family=AF_INET;
-    addr.sin_port=htons(peer_port);
-    inet_pton(AF_INET,peer_ip.c_str(),&addr.sin_addr);
-    if(connect(s,(sockaddr*)&addr,sizeof(addr))<0)
-    {
-        close(s);
-        return -1;
-    }
-    string msg="SYNC\n"+payload+"END\n";
-    ssize_t rem=msg.size();
-    const char*buf=msg.c_str();
-    while(rem>0)
-    {
-        ssize_t w=send(s,buf,(size_t)rem,0);
-        if(w<=0)
-        {
-            break;
-        }
-        rem-=w;
-        buf+=w;
-    }
-    // read ack (optional)
-    char ack[512];
-    ssize_t r=recv(s,ack,sizeof(ack)-1,0);
-    if(r>0)
-    {
-        ack[r]=0;
-    }
-    close(s);
-    if(rem==0)
-    {
+        stopping = true; if (replication.joinable()) replication.join(); server.stop();
+        std::cout << "Tracker stopped; durable journal retained" << std::endl;
         return 0;
-    }
-    return -1;
-}
-
-void retry_push_thread()
-{
-    while(true)
-    {
-        if(stop_retry==true)
-        {
-            break;
-        }
-        push_mtx.lock();
-        ifstream in("tracker_sync.txt");
-        if(!in)
-        {
-            push_mtx.unlock();
-            std::this_thread::sleep_for(std::chrono::seconds(5));
-            continue;
-        }
-        string content;
-        string line;
-        while(std::getline(in,line))
-        {
-            content+=line+"\n";
-        }
-        in.close();
-        push_mtx.unlock();
-        if(content.size()>0)
-        {
-            int r=push_sync_to_peer_once(content);
-            if(r==0)
-            {
-                // success
-            }
-        }
-        std::this_thread::sleep_for(std::chrono::seconds(5));
-    }
-}
-
-
-string process_command_for_conn(const string&cmd_line,int sock)
-{
-    cout<<"[Tracker "<<this_tracker_index+1<<"] Received from client "<<sock<<": "<<cmd_line<<endl;
-
-    stringstream ss(cmd_line);
-    string cmd;
-    ss>>cmd;
-
-    if(cmd=="create_user")
-    {
-        string uid,pw;
-        ss>>uid>>pw;
-        if(uid.size()==0||pw.size()==0)
-        {
-            return "ERROR invalid arguments\n";
-        }
-        state_mtx.lock();
-        if(global_state.users.find(uid)!=global_state.users.end())
-        {
-            state_mtx.unlock();
-            return "ERROR user exists\n";
-        }
-        global_state.users[uid]=pw;
-        state_mtx.unlock();
-        write_sync_file();
-        string payload=state_to_string();
-        push_sync_to_peer_once(payload);
-        return "SUCCESS user created\n";
-    }
-    else if(cmd=="login")
-    {
-        string uid,pw;
-        ss>>uid>>pw;
-        if(uid.size()==0||pw.size()==0)
-        {
-            return "ERROR invalid arguments\n";
-        }
-
-        state_mtx.lock();
-        auto it=global_state.users.find(uid);
-        if(it==global_state.users.end())
-        {
-            state_mtx.unlock();
-            return "ERROR no such user\n";
-        }
-        if(it->second!=pw)
-        {
-            state_mtx.unlock();
-            return "ERROR wrong password\n";
-        }
-        state_mtx.unlock();
-
-        // check if already logged in
-        session_mtx.lock();
-        for(auto &entry : sessions)
-        {
-            if(entry.second.userid==uid)
-            {
-                session_mtx.unlock();
-                return "User "+uid+" already logged in\n";
-            }
-        }
-
-        sessions[sock] = {uid,"",0}; // store only userid for now
-        session_mtx.unlock();
-
-        cout<<"[Tracker "<<this_tracker_index+1<<"] User "<<uid<<" logged in"<<endl;
-
-        return "SUCCESS logged in\n";
-    }
-
-
-    else if(cmd=="logout")
-    {
-        session_mtx.lock();
-        auto it=sessions.find(sock);
-        if(it==sessions.end())
-        {
-            session_mtx.unlock();
-            return "ERROR not logged in\n";
-        }
-        sessions.erase(it);
-        session_mtx.unlock();
-        return "SUCCESS logged out\n";
-    }
-    else if(cmd=="create_group")
-    {
-        session_mtx.lock();
-        auto sit=sessions.find(sock);
-        if(sit==sessions.end())
-        {
-            session_mtx.unlock();
-            return "ERROR not logged in\n";
-        }
-        string uid=sit->second.userid;
-        session_mtx.unlock();
-        string gid;
-        ss>>gid;
-        if(gid.size()==0)
-        {
-            return "ERROR invalid arguments\n";
-        }
-        state_mtx.lock();
-        if(global_state.group_owner.find(gid)!=global_state.group_owner.end())
-        {
-            state_mtx.unlock();
-            return "ERROR group exists\n";
-        }
-        global_state.group_owner[gid]=uid;
-        global_state.group_members[gid].insert(uid);
-        state_mtx.unlock();
-        write_sync_file();
-        string payload=state_to_string();
-        push_sync_to_peer_once(payload);
-        return "SUCCESS group created\n";
-    }
-    else if(cmd=="join_group")
-    {
-        session_mtx.lock();
-        auto sit=sessions.find(sock);
-        if(sit==sessions.end())
-        {
-            session_mtx.unlock();
-            return "ERROR not logged in\n";
-        }
-        string uid=sit->second.userid;
-        session_mtx.unlock();
-        string gid;
-        ss>>gid;
-        if(gid.size()==0)
-        {
-            return "ERROR invalid arguments\n";
-        }
-        state_mtx.lock();
-        if(global_state.group_owner.find(gid)==global_state.group_owner.end())
-        {
-            state_mtx.unlock();
-            return "ERROR no such group\n";
-        }
-        // if already a member
-        if(global_state.group_members[gid].find(uid)!=global_state.group_members[gid].end())
-        {
-            state_mtx.unlock();
-            return "ERROR already member\n";
-        }
-        global_state.join_requests[gid].push_back(uid);
-        state_mtx.unlock();
-        write_sync_file();
-        string payload=state_to_string();
-        push_sync_to_peer_once(payload);
-        return "SUCCESS join request sent\n";
-    }
-    else if(cmd=="leave_group")
-    {
-        session_mtx.lock();
-        auto sit=sessions.find(sock);
-        if(sit==sessions.end())
-        {
-            session_mtx.unlock();
-            return "ERROR not logged in\n";
-        }
-        string uid=sit->second.userid;
-        session_mtx.unlock();
-
-        string gid;
-        ss>>gid;
-        if(gid.size()==0)
-        {
-            return "ERROR invalid arguments\n";
-        }
-
-        state_mtx.lock();
-
-        // Check if user is the group owner
-        auto go=global_state.group_owner.find(gid);
-        if(go!=global_state.group_owner.end() && go->second==uid)
-        {
-            state_mtx.unlock();
-            return "ERROR group owner cannot leave the group\n";
-        }
-
-        if(global_state.group_members.find(gid)!=global_state.group_members.end())
-        {
-            global_state.group_members[gid].erase(uid);
-        }
-
-        // purge this user's files from this group
-        auto it=group_files.find(gid);
-        if(it!=group_files.end())
-        {
-            auto &vec=it->second;
-            vec.erase(
-                std::remove_if(vec.begin(),vec.end(),
-                    [&](const FileInfo&f){ return f.owner==uid; }),
-                vec.end()
-            );
-        }
-
-        state_mtx.unlock();
-        write_sync_file();
-        string payload=state_to_string();
-        push_sync_to_peer_once(payload);
-        return "SUCCESS left group\n";
-    }
-
-
-    else if(cmd=="list_groups")
-    {
-        state_mtx.lock();
-        stringstream out;
-        for(auto &p:global_state.group_owner)
-        {
-            out<<p.first<<"\n";
-        }
-        state_mtx.unlock();
-        return "GROUPS\n"+out.str();
-    }
-    else if(cmd=="list_requests")
-    {
-        session_mtx.lock();
-        auto sit=sessions.find(sock);
-        if(sit==sessions.end())
-        {
-            session_mtx.unlock();
-            return "ERROR not logged in\n";
-        }
-        string uid=sit->second.userid;
-        session_mtx.unlock();
-
-        string gid;
-        ss>>gid;
-        if(gid.size()==0)
-        {
-            return "ERROR invalid arguments\n";
-        }
-
-        state_mtx.lock();
-        auto go=global_state.group_owner.find(gid);
-        if(go==global_state.group_owner.end())
-        {
-            state_mtx.unlock();
-            return "ERROR no such group\n";
-        }
-        if(go->second!=uid)
-        {
-            state_mtx.unlock();
-            return "ERROR only group owner can view join requests\n";
-        }
-
-        stringstream out;
-        auto it=global_state.join_requests.find(gid);
-        if(it!=global_state.join_requests.end())
-        {
-            for(auto &u:it->second)
-            {
-                out<<u<<"\n";
-            }
-        }
-        state_mtx.unlock();
-        return "REQUESTS\n"+out.str();
-    }
-
-    else if(cmd=="accept_request")
-    {
-        session_mtx.lock();
-        auto sit=sessions.find(sock);
-        if(sit==sessions.end())
-        {
-            session_mtx.unlock();
-            return "ERROR not logged in\n";
-        }
-        string uid=sit->second.userid;
-        session_mtx.unlock();
-        string gid,req_user;
-        ss>>gid>>req_user;
-        if(gid.size()==0||req_user.size()==0)
-        {
-            return "ERROR invalid arguments\n";
-        }
-        state_mtx.lock();
-        auto go=global_state.group_owner.find(gid);
-        if(go==global_state.group_owner.end())
-        {
-            state_mtx.unlock();
-            return "ERROR no such group\n";
-        }
-        if(go->second!=uid)
-        {
-            state_mtx.unlock();
-            return "ERROR not group owner\n";
-        }
-        auto &vec=global_state.join_requests[gid];
-        bool found=false;
-        for(size_t i=0;i<vec.size();i++)
-        {
-            if(vec[i]==req_user)
-            {
-                vec.erase(vec.begin()+i);
-                found=true;
-                break;
-            }
-        }
-        if(found==true)
-        {
-            global_state.group_members[gid].insert(req_user);
-        }
-        state_mtx.unlock();
-        write_sync_file();
-        string payload=state_to_string();
-        push_sync_to_peer_once(payload);
-        if(found==true)
-        {
-            return "SUCCESS request accepted\n";
-        }
-        else
-        {
-            return "ERROR request not found\n";
-        }
-    }
-    else if(cmd=="upload_file")
-    {
-        session_mtx.lock();
-        auto sit=sessions.find(sock);
-        if(sit==sessions.end())
-        {
-            session_mtx.unlock();
-            return "ERROR not logged in\n";
-        }
-        string uid=sit->second.userid;
-        session_mtx.unlock();
-
-        string gid;
-        ss>>gid;
-
-        string token;
-        string fpath;
-        string addr;
-        int num_pieces=0;
-        string file_hash;
-        long long file_size=0;
-        bool addr_found=false;
-
-        // collect filename tokens until we see ip:port
-        while(ss>>token)
-        {
-            if(token.find(':')!=string::npos) // ip:port found
-            {
-                addr=token;
-                ss>>num_pieces>>file_hash>>file_size;
-                addr_found=true;
-                break;
-            }
-            else
-            {
-                if(!fpath.empty())
-                {
-                    fpath=fpath+" ";
-                }
-                fpath=fpath+token;
-            }
-        }
-
-        if(gid.size()==0||fpath.size()==0||addr_found==false||num_pieces<=0||file_hash.size()==0)
-        {
-            return "ERROR invalid arguments\n";
-        }
-
-        string cip; int cport;
-        if(!parse_ipport(addr,cip,cport))
-        {
-            return "ERROR invalid client address\n";
-        }
-
-        vector<string> piece_hashes;
-        for(int i=0;i<num_pieces;i++)
-        {
-            string h; ss>>h;
-            piece_hashes.push_back(h);
-        }
-
-        state_mtx.lock();
-        if(global_state.group_owner.find(gid)==global_state.group_owner.end())
-        {
-            state_mtx.unlock();
-            return "ERROR no such group\n";
-        }
-        if(global_state.group_members[gid].find(uid)==global_state.group_members[gid].end())
-        {
-            state_mtx.unlock();
-            return "ERROR not a group member\n";
-        }
-
-        // allow multiple seeders: only block if same user already registered this file
-        bool exists=false;
-        for(auto &f:group_files[gid])
-        {
-            if(f.file_hash==file_hash && f.owner==uid)
-            {
-                exists=true;
-                break;
-            }
-        }
-
-        if(exists)
-        {
-            state_mtx.unlock();
-            return "ERROR you already uploaded this file\n";
-        }
-
-        FileInfo fi;
-        fi.owner=uid;
-        fi.ip=cip;
-        fi.port=cport;
-        fi.path=fpath;
-        fi.num_pieces=num_pieces;
-        fi.file_hash=file_hash;
-        fi.file_size=file_size;
-        fi.piece_hashes=piece_hashes;
-        group_files[gid].push_back(fi);
-
-        state_mtx.unlock();
-
-        write_sync_file();
-        string payload=state_to_string();
-        push_sync_to_peer_once(payload);
-
-        cout<<"[Tracker "<<this_tracker_index+1<<"] User "<<uid<<" uploaded file "<<fpath<<" to group "<<gid<<endl;
-
-        return "SUCCESS file uploaded\n";
-    }
-    else if(cmd=="stop_share")
-    {
-        session_mtx.lock();
-        auto sit=sessions.find(sock);
-        if(sit==sessions.end())
-        {
-            session_mtx.unlock();
-            return "ERROR not logged in\n";
-        }
-        string uid=sit->second.userid;
-        session_mtx.unlock();
-
-        string gid,fname;
-        ss>>gid>>fname;
-        if(gid.empty()||fname.empty())
-        {
-            return "ERROR invalid arguments\n";
-        }
-
-        state_mtx.lock();
-        // check membership
-        if(global_state.group_members[gid].find(uid)==global_state.group_members[gid].end())
-        {
-            state_mtx.unlock();
-            return "ERROR not a group member\n";
-        }
-
-        // erase only this user's file entry
-        auto it=group_files.find(gid);
-        if(it!=group_files.end())
-        {
-            auto &vec=it->second;
-            size_t before=vec.size();
-            vec.erase(
-                std::remove_if(vec.begin(),vec.end(),
-                    [&](const FileInfo&f){ return f.owner==uid && f.path==fname; }),
-                vec.end()
-            );
-            if(vec.size()<before)
-            {
-                state_mtx.unlock();
-                write_sync_file();
-                string payload=state_to_string();
-                push_sync_to_peer_once(payload);
-                return "SUCCESS stopped sharing file\n";
-            }
-        }
-        state_mtx.unlock();
-        return "ERROR file not found or not owned by you\n";
-    }
-    else if(cmd=="list_files")
-    {
-        session_mtx.lock();
-        auto sit=sessions.find(sock);
-        if(sit==sessions.end())
-        {
-            session_mtx.unlock();
-            return "ERROR not logged in\n";
-        }
-        string uid=sit->second.userid;
-        session_mtx.unlock();
-
-        string gid;
-        ss>>gid;
-        if(gid.size()==0)
-        {
-            return "ERROR invalid arguments\n";
-        }
-
-        state_mtx.lock();
-        // check if group exists
-        if(global_state.group_owner.find(gid)==global_state.group_owner.end())
-        {
-            state_mtx.unlock();
-            return "ERROR no such group\n";
-        }
-
-        // check if user is a member
-        if(global_state.group_members[gid].find(uid)==global_state.group_members[gid].end())
-        {
-            state_mtx.unlock();
-            return "ERROR not a group member\n";
-        }
-
-        stringstream out;
-        auto it=group_files.find(gid);
-        if(it!=group_files.end())
-        {
-            for(auto &f:it->second)
-            {
-                out<<f.path<<" (owner: "<<f.owner<<")\n";
-            }
-        }
-        state_mtx.unlock();
-
-        return "FILES\n"+out.str();
-    }
-    else if(cmd=="download_file")
-    {
-        session_mtx.lock();
-        auto sit=sessions.find(sock);
-        if(sit==sessions.end())
-        {
-            session_mtx.unlock();
-            return "ERROR not logged in\n";
-        }
-        string uid=sit->second.userid;
-        session_mtx.unlock();
-
-        string gid;
-        ss>>gid;
-
-        // get rest of line as filename (may contain spaces or quotes)
-        // get rest of line (filename + maybe destination)
-        string rest;
-        getline(ss,rest);
-        rest=trim(rest);
-
-        // split rest: first token is filename (may be quoted)
-        string fname;
-        if(rest.size()>0 && (rest.front()=='"'||rest.front()=='\''))
-        {
-            char q=rest.front();
-            size_t qend=rest.find(q,1);
-            if(qend!=string::npos)
-            {
-                fname=rest.substr(1,qend-1);
-            }
-        }
-        else
-        {
-            size_t sp=rest.find(' ');
-            if(sp!=string::npos)
-            {
-                fname=rest.substr(0,sp);
-            }
-            else
-            {
-                fname=rest;
-            }
-        }
-
-
-        if(gid.size()==0||fname.size()==0)
-        {
-            return "ERROR invalid arguments\n";
-        }
-
-        state_mtx.lock();
-        if(global_state.group_owner.find(gid)==global_state.group_owner.end())
-        {
-            state_mtx.unlock();
-            return "ERROR no such group\n";
-        }
-        if(global_state.group_members[gid].find(uid)==global_state.group_members[gid].end())
-        {
-            state_mtx.unlock();
-            return "ERROR not a group member\n";
-        }
-
-        auto it=group_files.find(gid);
-        if(it==group_files.end())
-        {
-            state_mtx.unlock();
-            return "ERROR no files in this group\n";
-        }
-
-        vector<FileInfo> matches;
-        for(auto &f:it->second)
-        {
-            if(f.path==fname)
-            {
-                // check if this owner is currently logged in
-                bool logged_in=false;
-                session_mtx.lock();
-                for(auto &s:sessions)
-                {
-                    if(s.second.userid==f.owner)
-                    {
-                        logged_in=true;
-                        break;
-                    }
-                }
-                session_mtx.unlock();
-
-                if(logged_in)
-                {
-                    matches.push_back(f);
-                }
-            }
-        }
-        if(matches.empty())
-        {
-            state_mtx.unlock();
-            return "ERROR file not found\n";
-        }
-
-        // use the first file entry to get metadata (hashes, num_pieces, file_size)
-        FileInfo target=matches[0];
-
-        stringstream out;
-        out<<"PEERS";
-        for(auto &f:matches)
-        {
-            out<<" "<<f.ip<<":"<<f.port;
-        }
-        out<<"\n";
-        out<<"NUM "<<target.num_pieces<<"\n";
-        out<<"FILEHASH "<<target.file_hash<<"\n";
-        out<<"FILESIZE "<<target.file_size<<"\n";
-        out<<"PIECES";
-        for(auto &h:target.piece_hashes)
-        {
-            out<<" "<<h;
-        }
-        out<<"\n";
-
-        state_mtx.unlock();
-        return out.str();
-    }
-    else if(cmd=="SYNC")
-    {
-        // full payload follows after newline; in our socket handling we already assemble entire payload
-        // here treat remainder of cmd_line as payload
-        size_t pos=cmd_line.find('\n');
-        string payload;
-        if(pos!=string::npos)
-        {
-            payload=cmd_line.substr(pos+1);
-        }
-        if(payload.size()>0)
-        {
-            apply_state_from_string(payload);
-            write_sync_file();
-            return "SUCCESS sync applied\n";
-        }
-        return "ERROR invalid sync\n";
-    }
-    return "ERROR unknown command\n";
-}
-
-void handle_connection(int client_sock)
-{
-    const int BUF=4096;
-    char buffer[BUF];
-    string acc;
-    while(running)
-    {
-        ssize_t r=recv(client_sock,buffer,BUF,0);
-        if(r<=0)
-        {
-            break;
-        }
-        acc.append(buffer,(size_t)r);
-        while(true)
-        {
-            size_t pos=acc.find('\n');
-            if(pos==string::npos)
-            {
-                break;
-            }
-            string line=acc.substr(0,pos);
-            acc.erase(0,pos+1);
-            string tline=trim(line);
-            if(tline.size()==0)
-            {
-                continue;
-            }
-            if(tline=="SYNC")
-            {
-                string payload;
-                while(true)
-                {
-                    size_t pos2=acc.find("\nEND\n");
-                    if(pos2!=string::npos)
-                    {
-                        payload+=acc.substr(0,pos2);
-                        acc.erase(0,pos2+5);
-                        break;
-                    }
-                    ssize_t r2=recv(client_sock,buffer,BUF,0);
-                    if(r2<=0)
-                    {
-                        break;
-                    }
-                    acc.append(buffer,(size_t)r2);
-                }
-                if(payload.size()>0)
-                {
-                    apply_state_from_string(payload);
-                    write_sync_file();
-                    string resp="SUCCESS sync applied\n";
-                    send(client_sock,resp.c_str(),(size_t)resp.size(),0);
-                }
-                continue;
-            }
-            string resp=process_command_for_conn(tline,client_sock);
-            send(client_sock,resp.c_str(),(size_t)resp.size(),0);
-        }
-    }
-    session_mtx.lock();
-    auto it=sessions.find(client_sock);
-    if(it!=sessions.end())
-    {
-        string uid=it->second.userid;
-        sessions.erase(it);
-        session_mtx.unlock();
-
-        cout<<"[Tracker "<<this_tracker_index+1<<"] User "<<uid<<" disconnected, session ended"<<endl;
-    }
-    else
-    {
-        session_mtx.unlock();
-    }
-    close(client_sock);
-
-}
-
-int make_listen_socket(const string&ip,int port)
-{
-    int s=socket(AF_INET,SOCK_STREAM,0);
-    if(s<0)
-    {
-        perror("socket");
-        return -1;
-    }
-    int opt=1;
-    setsockopt(s,SOL_SOCKET,SO_REUSEADDR,&opt,sizeof(opt));
-    sockaddr_in addr;
-    addr.sin_family=AF_INET;
-    addr.sin_port=htons(port);
-    inet_pton(AF_INET,ip.c_str(),&addr.sin_addr);
-    if(::bind(s,(sockaddr*)&addr,sizeof(addr))<0)
-    {
-        perror("bind");
-        close(s);
-        return -1;
-    }
-    if(listen(s,10)<0)
-    {
-        perror("listen");
-        close(s);
-        return -1;
-    }
-    return s;
-}
-
-void console_thread()
-{
-    string line;
-    while(true)
-    {
-        if(!getline(cin,line))
-        {
-            break;
-        }
-        if(trim(line)=="quit")
-        {
-            cout<<"[Tracker "<<this_tracker_index+1<<"] Shutdown requested from console"<<endl;
-            running=false;
-            if(listen_sock!=-1)
-            {
-                shutdown(listen_sock,SHUT_RDWR);
-                close(listen_sock);
-                listen_sock=-1;
-            }
-            break;
-        }
-    }
-}
-
-int main(int argc,char**argv)
-{
-    if(argc<3)
-    {
-        cout<<"Usage: "<<argv[0]<<" tracker_info.txt <tracker_no(1|2)>"<<endl;
-        return 1;
-    }
-    string tfile=argv[1];
-    this_tracker_index=atoi(argv[2])-1;
-    load_tracker_info(tfile);
-
-    // create a lock file for this tracker
-    lockfile = "tracker" + std::to_string(this_tracker_index+1) + ".lock";
-    {
-        std::ofstream lf(lockfile);
-        lf << "running";
-    }
-
-    if(this_tracker_index<0||this_tracker_index>=(int)trackers.size())
-    {
-        cerr<<"invalid tracker index"<<endl;
-        return 1;
-    }
-    load_sync_file();
-    thread retryt(retry_push_thread);
-    retryt.detach();
-
-    thread console(console_thread);
-    console.detach();
-
-    string bind_ip=trackers[this_tracker_index].first;
-    int bind_port=trackers[this_tracker_index].second;
-    listen_sock=make_listen_socket(bind_ip,bind_port);
-    if(listen_sock<0)
-    {
-        cerr<<"failed to create listen socket"<<endl;
-        stop_retry=true;
-        return 1;
-    }
-    cout<<"Tracker listening on "<<bind_ip<<":"<<bind_port<<endl;
-
-    while(running)
-    {
-        sockaddr_in cli;
-        socklen_t len=sizeof(cli);
-        int cs=accept(listen_sock,(sockaddr*)&cli,&len);
-        if(cs<0)
-        {
-            if(!running) break;
-            continue;
-        }
-        thread t(handle_connection,cs);
-        t.detach();
-    }
-    close(listen_sock);
-    stop_retry=true;
-    cout<<"[Tracker "<<this_tracker_index+1<<"] Exiting"<<endl;
-
-    // remove this tracker's lock file (we still keep creating locks on startup; remove ours now)
-    remove(lockfile.c_str());
-
-    // If there are other trackers configured, check whether any other tracker is actually listening.
-    // Only delete tracker_sync.txt if no other tracker responds.
-    bool other_alive=false;
-    if(trackers.size()>=2)
-    {
-        for(size_t i=0;i<trackers.size();i++)
-        {
-            if((int)i==this_tracker_index)
-            {
-                continue;
-            }
-            string tip=trackers[i].first;
-            int tport=trackers[i].second;
-
-            int psock=socket(AF_INET,SOCK_STREAM,0);
-            if(psock<0)
-            {
-                continue;
-            }
-
-            // set non-blocking so connect won't hang for long
-            int flags=fcntl(psock,F_GETFL,0);
-            if(flags!=-1)
-            {
-                fcntl(psock,F_SETFL,flags|O_NONBLOCK);
-            }
-
-            sockaddr_in peer;
-            peer.sin_family=AF_INET;
-            peer.sin_port=htons(tport);
-            inet_pton(AF_INET,tip.c_str(),&peer.sin_addr);
-
-            int cres=connect(psock,(sockaddr*)&peer,sizeof(peer));
-            if(cres==0)
-            {
-                // immediate connect success -> other tracker alive
-                other_alive=true;
-                close(psock);
-                break;
-            }
-            else
-            {
-                if(errno==EINPROGRESS || errno==EWOULDBLOCK)
-                {
-                    fd_set wf;
-                    FD_ZERO(&wf);
-                    FD_SET(psock,&wf);
-                    struct timeval tv;
-                    tv.tv_sec=1; // 1 second timeout
-                    tv.tv_usec=0;
-                    int sel=select(psock+1,NULL,&wf,NULL,&tv);
-                    if(sel>0 && FD_ISSET(psock,&wf))
-                    {
-                        int err=0;
-                        socklen_t elen=sizeof(err);
-                        if(getsockopt(psock,SOL_SOCKET,SO_ERROR,&err,&elen)==0 && err==0)
-                        {
-                            other_alive=true;
-                            close(psock);
-                            break;
-                        }
-                    }
-                }
-            }
-            close(psock);
-        }
-    }
-
-    // If no other tracker responded, safe to delete the synced file
-    if(!other_alive)
-    {
-        remove("tracker_sync.txt");
-    }
-
-    return 0;
+    } catch (const std::exception& e) { std::cerr << "ERROR " << e.what() << std::endl; return 1; }
 }

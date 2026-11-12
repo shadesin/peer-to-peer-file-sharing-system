@@ -1,0 +1,28 @@
+test_command_argument_positions_and_invalid_files (__main__.Integration.test_command_argument_positions_and_invalid_files) ... ok
+test_concurrent_connected_writes_are_not_lost (__main__.Integration.test_concurrent_connected_writes_are_not_lost) ... ok
+test_conflicting_content_and_failed_share_are_isolated (__main__.Integration.test_conflicting_content_and_failed_share_are_isolated) ... ok
+test_corrupted_and_disconnected_peers_retry_elsewhere (__main__.Integration.test_corrupted_and_disconnected_peers_retry_elsewhere) ... ok
+test_cross_tracker_sessions_and_authenticated_failover (__main__.Integration.test_cross_tracker_sessions_and_authenticated_failover) ... ok
+test_existing_destination_is_preserved (__main__.Integration.test_existing_destination_is_preserved) ... ok
+test_failed_download_reports_failure_without_hanging_or_partial_output (__main__.Integration.test_failed_download_reports_failure_without_hanging_or_partial_output) ... ok
+test_fragmented_and_coalesced_protocol_and_malformed_requests (__main__.Integration.test_fragmented_and_coalesced_protocol_and_malformed_requests) ... ok
+test_fragmented_tracker_responses_and_forged_response_failover (__main__.Integration.test_fragmented_tracker_responses_and_forged_response_failover) ... ok
+test_full_file_hash_mismatch_does_not_publish (__main__.Integration.test_full_file_hash_mismatch_does_not_publish) ... ok
+test_group_scope_logout_and_unauthorized_peer_access (__main__.Integration.test_group_scope_logout_and_unauthorized_peer_access) ... ok
+test_idempotent_mutation_retries (__main__.Integration.test_idempotent_mutation_retries) ... ok
+test_incomplete_journal_tail_is_recovered (__main__.Integration.test_incomplete_journal_tail_is_recovered) ... ok
+test_leaving_group_revokes_previously_issued_ticket (__main__.Integration.test_leaving_group_revokes_previously_issued_ticket) ... ok
+test_one_gib_transfer (__main__.Integration.test_one_gib_transfer) ... skipped 'set P2P_LARGE_TEST=1 for 1 GiB transfer'
+test_owner_leave_transfers_or_deletes_group (__main__.Integration.test_owner_leave_transfers_or_deletes_group) ... ok
+test_partition_conflicts_converge_to_documented_winner (__main__.Integration.test_partition_conflicts_converge_to_documented_winner) ... ok
+test_partitioned_independent_writes_merge_without_loss (__main__.Integration.test_partitioned_independent_writes_merge_without_loss) ... ok
+test_piece_boundaries_renaming_and_persistent_status (__main__.Integration.test_piece_boundaries_renaming_and_persistent_status) ... ok
+test_recovery_preserves_acknowledged_writes_and_full_shutdown (__main__.Integration.test_recovery_preserves_acknowledged_writes_and_full_shutdown) ... ok
+test_stalled_peer_deadline_and_simultaneous_downloads (__main__.Integration.test_stalled_peer_deadline_and_simultaneous_downloads) ... ok
+test_tracker_failure_during_download_preserves_jobs_and_registration (__main__.Integration.test_tracker_failure_during_download_preserves_jobs_and_registration) ... ok
+test_two_real_seeders_and_original_identity_after_rename (__main__.Integration.test_two_real_seeders_and_original_identity_after_rename) ... ok
+
+----------------------------------------------------------------------
+Ran 23 tests in 32.907s
+
+OK (skipped=1)
